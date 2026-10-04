@@ -1,0 +1,98 @@
+{
+  "schema_version": "ftfuzz.bytecode_plan.v1",
+  "description": "Format-agnostic bytecode mutation plan — 8 primitives operating on raw byte buffer",
+  "allowed_opcodes": {
+    "FIND": {
+      "description": "Search for exact byte sequence in buffer, store named offset reference for later ops",
+      "parameters": {
+        "pattern": { "type": "string", "format": "hex", "required": true, "desc": "Hex-encoded bytes to search for" },
+        "output": { "type": "string", "required": true, "desc": "Named offset reference (e.g., 'tbl', 'elf_hdr')" },
+        "start": { "type": "string", "required": false, "desc": "Start search at this offset (absolute or {ref}+N)" },
+        "occurrence": { "type": "integer", "required": false, "default": 1, "desc": "Which occurrence to match (1=first)" }
+      },
+      "failure": "skip — dependent ops that reference this output also become no-ops"
+    },
+    "WRITE": {
+      "description": "Overwrite bytes at offset without changing buffer size",
+      "parameters": {
+        "offset": { "type": "string", "required": true, "desc": "Absolute offset, {ref}, or {ref}+N" },
+        "data": { "type": "string", "format": "hex", "required": true, "desc": "Hex-encoded bytes to write" }
+      },
+      "failure": "skip"
+    },
+    "INSERT": {
+      "description": "Insert bytes at offset, shifting everything right",
+      "parameters": {
+        "offset": { "type": "string", "required": true, "desc": "Absolute offset, {ref}, or {ref}+N" },
+        "data": { "type": "string", "format": "hex", "required": true, "desc": "Hex-encoded bytes to insert" }
+      },
+      "failure": "skip (e.g., would exceed max buffer size)"
+    },
+    "DELETE": {
+      "description": "Remove byte range, shifting everything left",
+      "parameters": {
+        "offset": { "type": "string", "required": true, "desc": "Start offset of range to delete" },
+        "length": { "type": "integer", "required": true, "desc": "Number of bytes to delete" }
+      },
+      "failure": "skip (e.g., offset past buffer end)"
+    },
+    "SET_INT": {
+      "description": "Write integer value at offset with specified width and endianness",
+      "parameters": {
+        "offset": { "type": "string", "required": true, "desc": "Absolute offset, {ref}, or {ref}+N" },
+        "width": { "type": "integer", "required": true, "enum": [1, 2, 4, 8], "desc": "Integer width in bytes" },
+        "endian": { "type": "string", "required": true, "enum": ["le", "be"], "desc": "Byte order" },
+        "value": { "type": "integer", "required": true, "desc": "Integer value to write" }
+      },
+      "failure": "skip"
+    },
+    "INC_INT": {
+      "description": "Read integer, add delta, write back. Used for counter/size adjustments.",
+      "parameters": {
+        "offset": { "type": "string", "required": true, "desc": "Absolute offset, {ref}, or {ref}+N" },
+        "width": { "type": "integer", "required": true, "enum": [1, 2, 4, 8], "desc": "Integer width in bytes" },
+        "endian": { "type": "string", "required": true, "enum": ["le", "be"], "desc": "Byte order" },
+        "delta": { "type": "integer", "required": true, "desc": "Signed delta to add (negative = decrement)" }
+      },
+      "failure": "skip"
+    },
+    "SIZE_TO": {
+      "description": "Set integer field to the byte-length between two named offset references. The most critical primitive for binary formats — updates length/size fields after mutation.",
+      "parameters": {
+        "field_offset": { "type": "string", "required": true, "desc": "Offset of the integer to update" },
+        "width": { "type": "integer", "required": true, "enum": [1, 2, 4, 8], "desc": "Integer width in bytes" },
+        "endian": { "type": "string", "required": true, "enum": ["le", "be"], "desc": "Byte order" },
+        "range_start": { "type": "string", "required": true, "desc": "Named offset ref for range start" },
+        "range_end": { "type": "string", "required": true, "desc": "Named offset ref for range end, or 'END' for buffer end" }
+      },
+      "failure": "skip (e.g., refs unresolved)"
+    },
+    "PRESERVE": {
+      "description": "Protect byte range from AFL++ havoc mutation phase",
+      "parameters": {
+        "offset": { "type": "string", "required": true, "desc": "Start offset" },
+        "length": { "type": "integer", "required": true, "desc": "Number of bytes to protect" }
+      },
+      "failure": "skip"
+    }
+  },
+  "offset_syntax": {
+    "absolute": "Plain integer offset (e.g., 0, 4, 64)",
+    "find_ref": "Reference a FIND output (e.g., {elf_hdr})",
+    "find_ref_plus": "FIND output + constant (e.g., {elf_hdr}+16)",
+    "end": "Special: 'END' refers to the end of the buffer (for SIZE_TO range_end)"
+  },
+  "output_format": {
+    "schema_version": "ftfuzz.bytecode_plan.v1",
+    "fields": {
+      "transition_id": "string — barrier transition this plan targets",
+      "desired_outcome": "boolean — which branch direction to aim for",
+      "mechanism": { "type": "string — brief description of the strategy" },
+      "steps": "array of step objects, each with {op, params: {...}}",
+      "scaffold_template": "optional hex string — complete valid input as fallback",
+      "scaffold_script": "optional Python3 script — generate scaffold bytes programmatically",
+      "focus_ranges": "optional array — byte ranges that control the barrier",
+      "preserve_ranges": "optional array — byte ranges that must stay intact"
+    }
+  }
+}

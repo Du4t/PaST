@@ -1,0 +1,136 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FTFuzz Semantic MutationPolicy",
+  "description": "A MutationPolicy generated from Pre/PostState semantic summaries. Contains semantic hints only; byte ranges are filled by field inference in a later stage.",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "source", "policies"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ftfuzz.semantic_mutation_policy.v1"
+    },
+    "generated_at": {"type": "string", "format": "date-time"},
+    "source": {
+      "type": "object",
+      "required": ["semantics_file", "online_context_file"],
+      "properties": {
+        "semantics_file": {"type": "string"},
+        "online_context_file": {"type": "string"},
+        "barrier_ranking_file": {"type": "string"},
+        "seed_buckets_file": {"type": "string"},
+        "cmp_evidence_file": {"type": "string"}
+      }
+    },
+    "policies": {
+      "type": "object",
+      "patternProperties": {
+        "^T_AUTO_\\d+$": {
+          "type": "object",
+          "required": ["transition_id", "enabled", "policy_version", "policy_type", "mutation_actions"],
+          "properties": {
+            "transition_id": {"type": "string"},
+            "enabled": {"type": "boolean"},
+            "policy_version": {"type": "integer", "minimum": 1},
+            "policy_type": {"type": "string", "enum": ["semantic", "fallback", "hybrid"]},
+            "priority": {"type": "number"},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "activation": {
+              "type": "object",
+              "properties": {
+                "requires_active_transition": {"type": "boolean"},
+                "min_pre_count": {"type": "integer"},
+                "max_stsr": {"type": "number"},
+                "preferred_state_classes": {"type": "array", "items": {"type": "string"}}
+              }
+            },
+            "semantic_basis": {
+              "type": "object",
+              "properties": {
+                "pre_state_summary": {"type": "string"},
+                "barrier_summary": {"type": "string"},
+                "post_state_summary": {"type": "string"},
+                "transition_constraints": {"type": "object"}
+              }
+            },
+            "mutation_actions": {
+              "type": "object",
+              "required": ["preserve_hints", "focus_hints", "dictionary_tokens", "numeric_hints", "operator_weights"],
+              "properties": {
+                "preserve_hints": {"type": "array", "items": {"$ref": "#/definitions/semantic_hint"}},
+                "focus_hints": {"type": "array", "items": {"$ref": "#/definitions/semantic_hint"}},
+                "dictionary_tokens": {"type": "array", "items": {"$ref": "#/definitions/dictionary_token"}},
+                "numeric_hints": {"type": "array", "items": {"$ref": "#/definitions/numeric_hint"}},
+                "structure_hints": {"type": "array", "items": {"$ref": "#/definitions/semantic_hint"}},
+                "repair_hints": {"type": "array", "items": {"$ref": "#/definitions/semantic_hint"}},
+                "operator_weights": {
+                  "type": "object",
+                  "properties": {
+                    "fallback_havoc": {"type": "number"},
+                    "dictionary_insert": {"type": "number"},
+                    "region_focus": {"type": "number"},
+                    "numeric_boundary": {"type": "number"},
+                    "structure_insert": {"type": "number"},
+                    "repair": {"type": "number"}
+                  }
+                }
+              }
+            },
+            "runtime_grounding": {
+              "type": "object",
+              "properties": {
+                "stsr": {"type": "number"},
+                "pre_count": {"type": "integer"},
+                "barrier_count": {"type": "integer"},
+                "post_count": {"type": "integer"},
+                "top_seed_buckets": {"type": "object"},
+                "cmp_evidence": {"type": "array", "items": {"type": "object"}}
+              }
+            },
+            "validation": {
+              "type": "object",
+              "properties": {
+                "status": {"type": "string", "enum": ["unvalidated", "validated", "failed"]},
+                "last_applied_version": {"type": "integer"},
+                "success_metric": {"type": "string"}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "semantic_hint": {
+      "type": "object",
+      "required": ["kind", "description", "source"],
+      "properties": {
+        "kind": {"type": "string"},
+        "description": {"type": "string"},
+        "source": {"type": "string"},
+        "confidence": {"type": "number"}
+      }
+    },
+    "dictionary_token": {
+      "type": "object",
+      "required": ["token", "source"],
+      "properties": {
+        "token": {"type": "string"},
+        "encoding": {"type": "string", "enum": ["ascii", "utf8", "hex"]},
+        "source": {"type": "string", "enum": ["llm_semantics", "rule_extractor", "format_heuristic"]},
+        "weight": {"type": "number"},
+        "reason": {"type": "string"}
+      }
+    },
+    "numeric_hint": {
+      "type": "object",
+      "required": ["kind", "role", "source"],
+      "properties": {
+        "kind": {"type": "string", "const": "numeric_semantic"},
+        "role": {"type": "string"},
+        "direction": {"type": "string"},
+        "source": {"type": "string"},
+        "confidence": {"type": "number"}
+      }
+    }
+  }
+}

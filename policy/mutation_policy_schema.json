@@ -1,0 +1,156 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MutationPolicy",
+  "description": "Schema for FTFuzz state-transition-guided dynamic mutation policy",
+  "type": "object",
+  "required": ["policy_id", "version", "enabled", "target_transition", "activation", "preserve_ranges", "focus_ranges", "numeric_fields", "dictionary_tokens", "operator_weights", "repair_rules", "validation"],
+  "properties": {
+    "policy_id": {
+      "type": "string",
+      "description": "Unique identifier for this policy"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing version number"
+    },
+    "enabled": {
+      "type": "boolean",
+      "description": "Whether this policy is active"
+    },
+    "target_transition": {
+      "type": "object",
+      "required": ["transition_id", "pre_state_id", "post_state_id", "barrier_id"],
+      "properties": {
+        "transition_id": { "type": "string" },
+        "pre_state_id": { "type": "string" },
+        "post_state_id": { "type": "string" },
+        "barrier_id": { "type": "string" }
+      }
+    },
+    "activation": {
+      "type": "object",
+      "required": ["required_barrier_id", "min_pre_hits", "max_stsr", "seed_state"],
+      "properties": {
+        "required_barrier_id": { "type": "string" },
+        "min_pre_hits": { "type": "integer", "minimum": 0 },
+        "max_stsr": { "type": "number", "minimum": 0, "maximum": 1 },
+        "seed_state": {
+          "type": "string",
+          "enum": ["fail_pre", "reach_pre", "near_post", "reach_post"]
+        }
+      }
+    },
+    "preserve_ranges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["start", "end", "weight"],
+        "properties": {
+          "start": { "type": "integer", "minimum": 0 },
+          "end": { "type": "integer", "minimum": 0 },
+          "weight": { "type": "number", "minimum": 0, "maximum": 1 },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "focus_ranges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["start", "end", "weight"],
+        "properties": {
+          "start": { "type": "integer", "minimum": 0 },
+          "end": { "type": "integer", "minimum": 0 },
+          "weight": { "type": "number", "minimum": 0, "maximum": 1 },
+          "role": { "type": "string" }
+        }
+      }
+    },
+    "numeric_fields": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["start", "end", "width", "endian", "signed", "role", "actions", "confidence"],
+        "properties": {
+          "start": { "type": "integer", "minimum": 0 },
+          "end": { "type": "integer", "minimum": 0 },
+          "width": { "type": "integer", "enum": [1, 2, 4, 8] },
+          "endian": { "type": "string", "enum": ["big", "little"] },
+          "signed": { "type": "boolean" },
+          "role": { "type": "string" },
+          "actions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["inc", "dec", "random_delta", "boundary", "fit_rhs"]
+            },
+            "minItems": 1
+          },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    },
+    "dictionary_tokens": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["token_hex", "weight"],
+        "properties": {
+          "token_hex": { "type": "string", "pattern": "^[0-9a-fA-F]+$" },
+          "weight": { "type": "number", "minimum": 0, "maximum": 1 },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "operator_weights": {
+      "type": "object",
+      "required": ["numeric_boundary", "directional_arithmetic", "byte_pattern_insert", "repair", "fallback"],
+      "properties": {
+        "numeric_boundary": { "type": "number", "minimum": 0 },
+        "directional_arithmetic": { "type": "number", "minimum": 0 },
+        "byte_pattern_insert": { "type": "number", "minimum": 0 },
+        "repair": { "type": "number", "minimum": 0 },
+        "fallback": { "type": "number", "minimum": 0 }
+      }
+    },
+    "repair_rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["length_recompute", "payload_size_fit", "checksum_repair"]
+          },
+          "length_range": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "payload_range": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "endian": { "type": "string", "enum": ["big", "little"] }
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "required": ["success_signal", "max_trials", "downgrade_on_no_gain"],
+      "properties": {
+        "success_signal": {
+          "type": "string",
+          "enum": ["reach_post", "new_edge", "crash"]
+        },
+        "max_trials": { "type": "integer", "minimum": 1 },
+        "downgrade_on_no_gain": { "type": "boolean" }
+      }
+    }
+  }
+}

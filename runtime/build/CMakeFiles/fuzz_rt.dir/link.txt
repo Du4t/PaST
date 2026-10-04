@@ -1,0 +1,2 @@
+/usr/bin/ar qc libfuzz_rt.a CMakeFiles/fuzz_rt.dir/src/fuzz_rt.c.o CMakeFiles/fuzz_rt.dir/src/distance_rt.c.o CMakeFiles/fuzz_rt.dir/src/cmp_rt.c.o CMakeFiles/fuzz_rt.dir/src/state_rt.c.o CMakeFiles/fuzz_rt.dir/src/dgf_rt.c.o
+/usr/bin/ranlib libfuzz_rt.a

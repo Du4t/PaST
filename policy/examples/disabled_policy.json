@@ -1,0 +1,34 @@
+{
+  "policy_id": "P_TLB_001",
+  "version": 1,
+  "enabled": false,
+  "target_transition": {
+    "transition_id": "T_001",
+    "pre_state_id": "S_MAGIC_OK",
+    "post_state_id": "S_LEN_OK",
+    "barrier_id": "B_LEN_CHECK"
+  },
+  "activation": {
+    "required_barrier_id": "B_LEN_CHECK",
+    "min_pre_hits": 100,
+    "max_stsr": 0.05,
+    "seed_state": "reach_pre"
+  },
+  "preserve_ranges": [],
+  "focus_ranges": [],
+  "numeric_fields": [],
+  "dictionary_tokens": [],
+  "operator_weights": {
+    "numeric_boundary": 0.0,
+    "directional_arithmetic": 0.0,
+    "byte_pattern_insert": 0.0,
+    "repair": 0.0,
+    "fallback": 1.0
+  },
+  "repair_rules": [],
+  "validation": {
+    "success_signal": "reach_post",
+    "max_trials": 5000,
+    "downgrade_on_no_gain": true
+  }
+}

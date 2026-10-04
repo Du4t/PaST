@@ -1,0 +1,122 @@
+{
+  "schema_version": "ftfuzz.mutator_capabilities.v1",
+  "description": "Declared capabilities of the FTFuzz semantic mutator",
+  "operators": {
+    "PRESERVE_REGION": {
+      "supported": true,
+      "description": "Exclude a byte range from mutation",
+      "requirements": ["preserve_range"],
+      "fallback": "PRESERVE_AWARE_HAVOC"
+    },
+    "DELETE_REGION": {
+      "supported": true,
+      "description": "Remove all bytes in a range",
+      "requirements": ["focus_range_or_token_scan"],
+      "fallback": null
+    },
+    "EMPTY_REGION": {
+      "supported": true,
+      "description": "Replace region content with a minimal placeholder",
+      "requirements": ["focus_range", "boundary_evidence"],
+      "fallback": "DELETE_REGION"
+    },
+    "REMOVE_TOKENS": {
+      "supported": true,
+      "description": "Scan for and remove specific token patterns",
+      "requirements": ["evidence_tokens"],
+      "fallback": "DELETE_REGION"
+    },
+    "FORBID_TOKENS": {
+      "supported": true,
+      "description": "Prevent specific tokens from being inserted",
+      "requirements": ["evidence_tokens"],
+      "fallback": null
+    },
+    "INSERT_TOKEN_IN_REGION": {
+      "supported": true,
+      "description": "Insert tokens only within a grounded scope",
+      "requirements": ["scope", "token_source"],
+      "fallback": null
+    },
+    "DUPLICATE_REGION": {
+      "supported": true,
+      "description": "Copy a region and insert the copy",
+      "requirements": ["source_region", "target_scope"],
+      "fallback": "INSERT_TOKEN_IN_REGION"
+    },
+    "MOVE_REGION_EARLIER": {
+      "supported": true,
+      "description": "Relocate a region to an earlier offset",
+      "requirements": ["source_region", "earlier_boundary"],
+      "fallback": "DELETE_REGION"
+    },
+    "EXTEND_AFTER_REGION": {
+      "supported": true,
+      "description": "Append seed self-bytes after a region",
+      "requirements": ["source_region", "extension_bytes_available"],
+      "fallback": null
+    },
+    "FOCUS_RANGE_HAVOC": {
+      "supported": true,
+      "description": "Apply standard havoc within a bounded range",
+      "requirements": ["focus_range"],
+      "fallback": "PRESERVE_AWARE_HAVOC"
+    },
+    "PRESERVE_AWARE_HAVOC": {
+      "supported": true,
+      "description": "Apply havoc while avoiding preserve regions",
+      "requirements": ["preserve_ranges"],
+      "fallback": null
+    },
+    "REJECT_UNSUPPORTED": {
+      "supported": true,
+      "description": "Reject the requested effect — cannot be lowered",
+      "requirements": [],
+      "fallback": null
+    },
+    "REPAIR_CHECKSUM": {
+      "supported": false,
+      "description": "Recompute and fix checksum fields",
+      "requirements": ["checksum_algorithm_known"],
+      "fallback": null,
+      "reason_unsupported": "Checksum algorithms are target-specific; not yet implemented"
+    },
+    "REPAIR_LENGTH_FIELD": {
+      "supported": false,
+      "description": "Update length fields after mutation",
+      "requirements": ["length_field_location", "updated_region_bounds"],
+      "fallback": null,
+      "reason_unsupported": "Length field repair requires format-specific knowledge; token-level repair is not generic"
+    }
+  },
+  "grounding_status_rules": {
+    "token_presence": {
+      "check": "scan seed bytes for evidence_tokens",
+      "fail_action": "downgrade_to_fallback_or_skip"
+    },
+    "focus_range": {
+      "check": "boundary_evidence or token_scan provides byte range",
+      "fail_action": "reject_atom"
+    },
+    "focus_range_optional": {
+      "check": "try to locate scope; if not found, use whole-seed fallback",
+      "fail_action": "accept_with_whole_seed_scope"
+    },
+    "preserve_range": {
+      "check": "reachability_region or declaration_region evidence provides range",
+      "fail_action": "reject_preserve_action"
+    },
+    "byte_window": {
+      "check": "surrounding bytes exist around evidence token positions",
+      "fail_action": "narrow_window_or_skip"
+    },
+    "boundary_evidence": {
+      "check": "opening and closing delimiters are identifiable",
+      "fail_action": "reject_atom"
+    },
+    "scope_from_transition": {
+      "check": "transition metadata defines scope",
+      "fail_action": "reject_atom"
+    }
+  }
+}

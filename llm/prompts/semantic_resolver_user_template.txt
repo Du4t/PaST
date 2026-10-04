@@ -1,0 +1,20 @@
+## Barrier Report
+{barrier_report}
+
+## Field Hypotheses
+{field_hypotheses}
+
+## Source Context
+{source_context}
+
+## Micro-Probing Results
+{micro_probe_results}
+
+---
+
+Based on the above information, produce a structured JSON mutation policy suggestion. Remember:
+- Only select fields supported by evidence
+- Assign appropriate mutation actions based on semantic type
+- PreState-preserving fields should have preserve=true
+- Transition-enabling fields should have focus=true
+- Return JSON only

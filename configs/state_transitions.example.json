@@ -1,0 +1,28 @@
+{
+  "target": {
+    "name": "libxml2_valid_1345",
+    "description": "Target around xmlSnprintfElementContent in valid.c:1345"
+  },
+  "state_transitions": [
+    {
+      "transition_id": "T_0001",
+      "name": "Reach content formatter branch",
+      "pre_state": {
+        "type": "bb",
+        "source": "valid.c:1323",
+        "function": "xmlSnprintfElementContent"
+      },
+      "barrier": {
+        "type": "branch",
+        "source": "valid.c:1326",
+        "function": "xmlSnprintfElementContent",
+        "preferred_direction": "towards_target"
+      },
+      "post_state": {
+        "type": "bb",
+        "source": "valid.c:1345",
+        "function": "xmlSnprintfElementContent"
+      }
+    }
+  ]
+}

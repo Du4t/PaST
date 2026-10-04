@@ -1,0 +1,66 @@
+{
+  "policy_id": "P_TLB_001",
+  "version": 1,
+  "enabled": true,
+  "target_transition": {
+    "transition_id": "T_001",
+    "pre_state_id": "S_MAGIC_OK",
+    "post_state_id": "S_LEN_OK",
+    "barrier_id": "B_LEN_CHECK"
+  },
+  "activation": {
+    "required_barrier_id": "B_LEN_CHECK",
+    "min_pre_hits": 100,
+    "max_stsr": 0.05,
+    "seed_state": "reach_pre"
+  },
+  "preserve_ranges": [
+    {
+      "start": 0,
+      "end": 4,
+      "weight": 0.95,
+      "reason": "magic header"
+    }
+  ],
+  "focus_ranges": [
+    {
+      "start": 4,
+      "end": 8,
+      "weight": 0.85,
+      "role": "transition_enabling"
+    }
+  ],
+  "numeric_fields": [
+    {
+      "start": 4,
+      "end": 8,
+      "width": 4,
+      "endian": "big",
+      "signed": false,
+      "role": "length",
+      "actions": ["inc", "dec", "boundary", "fit_rhs"],
+      "confidence": 0.8
+    }
+  ],
+  "dictionary_tokens": [],
+  "operator_weights": {
+    "numeric_boundary": 0.3,
+    "directional_arithmetic": 0.3,
+    "byte_pattern_insert": 0.1,
+    "repair": 0.2,
+    "fallback": 0.1
+  },
+  "repair_rules": [
+    {
+      "type": "length_recompute",
+      "length_range": [4, 8],
+      "payload_range": [12, 64],
+      "endian": "big"
+    }
+  ],
+  "validation": {
+    "success_signal": "reach_post",
+    "max_trials": 5000,
+    "downgrade_on_no_gain": true
+  }
+}

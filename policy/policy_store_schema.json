@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FTFuzz Policy Store",
+  "description": "Runtime-readable policy store with versioning and active policy selection. Compact version of semantic_policies.json for hot-read by custom mutator.",
+  "type": "object",
+  "required": ["schema_version", "store_version", "active_transition", "policies"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "ftfuzz.policy_store.v1"
+    },
+    "store_version": {"type": "integer", "minimum": 0},
+    "updated_at": {"type": "string", "format": "date-time"},
+    "active_transition": {"type": "string"},
+    "active_policy_version": {"type": "integer"},
+    "selection_reason": {"type": "string"},
+    "policies": {
+      "type": "object",
+      "patternProperties": {
+        ".*": {
+          "type": "object",
+          "required": ["transition_id", "policy_version", "enabled", "mutation_actions"],
+          "properties": {
+            "transition_id": {"type": "string"},
+            "policy_version": {"type": "integer"},
+            "enabled": {"type": "boolean"},
+            "priority": {"type": "number"},
+            "confidence": {"type": "number"},
+            "policy_type": {"type": "string"},
+            "mutation_actions": {
+              "type": "object",
+              "properties": {
+                "dictionary_tokens": {"type": "array"},
+                "operator_weights": {"type": "object"},
+                "preserve_hints_count": {"type": "integer"},
+                "focus_hints_count": {"type": "integer"},
+                "numeric_hints_count": {"type": "integer"},
+                "repair_hints_count": {"type": "integer"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "generated_by": {"type": "string"},
+        "mode": {"type": "string"},
+        "llm_used": {"type": "boolean"}
+      }
+    }
+  }
+}

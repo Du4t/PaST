@@ -1,0 +1,949 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include "mutation_policy_loader.h"
+
+static uint64_t g_store_version = 0;
+static ftfuzz_policy_store_v2_t g_store;
+static char g_store_path[512];
+static time_t g_store_mtime = 0;
+
+/* ---- state_id -> transition_id mapping (from state_map.csv) ---- */
+static char g_state_map[FTFUZZ_MAX_STATE_IDS][FTFUZZ_MAX_TRANSITION_ID];
+static int g_state_map_loaded = 0;
+
+int ftfuzz_state_map_load(const char *path) {
+    const char *env = getenv("FTFUZZ_STATE_MAP");
+    if (!path && env) path = env;
+    if (!path) return 0;
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) { fprintf(stderr, "[STATE_MAP] fopen failed: %s\n", path); return 0; }
+
+    memset(g_state_map, 0, sizeof(g_state_map));
+    char line[1024];
+    int count = 0;
+    int first = 1;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (first) { first = 0; continue; } /* skip header */
+
+        /* Parse: state_id,transition_id,... */
+        char *p = line;
+        int state_id = 0;
+        while (*p >= '0' && *p <= '9') { state_id = state_id * 10 + (*p - '0'); p++; }
+        if (*p != ',') continue; p++;
+
+        if (state_id <= 0 || state_id >= FTFUZZ_MAX_STATE_IDS) continue;
+
+        /* Only fill if not already set (first entry wins for duplicates) */
+        if (g_state_map[state_id][0] == 0) {
+            size_t i = 0;
+            while (*p && *p != ',' && i < FTFUZZ_MAX_TRANSITION_ID - 1)
+                g_state_map[state_id][i++] = *p++;
+            g_state_map[state_id][i] = 0;
+            count++;
+        }
+    }
+    fclose(fp);
+    g_state_map_loaded = 1;
+    fprintf(stderr, "[STATE_MAP] loaded %d state_id->transition_id mappings from %s\n", count, path);
+    return count;
+}
+
+int ftfuzz_state_map_lookup(int state_id, char *out_transition_id, size_t size) {
+    if (!g_state_map_loaded) return 0;
+    if (state_id <= 0 || state_id >= FTFUZZ_MAX_STATE_IDS) return 0;
+    if (g_state_map[state_id][0] == 0) return 0;
+    if (out_transition_id && size > 0) {
+        strncpy(out_transition_id, g_state_map[state_id], size - 1);
+        out_transition_id[size - 1] = 0;
+    }
+    return 1;
+}
+
+/* ---- minimal JSON helpers ---- */
+static int g_read_str_actual_len = 0;
+
+static void skip_ws(const char **p) {
+    while (**p && (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r')) (*p)++;
+}
+static int read_str(const char **p, char *out, size_t max) {
+    skip_ws(p); if (**p != '"') return 0; (*p)++;
+    size_t i = 0;
+    while (**p && **p != '"' && i < max - 1) {
+        if (**p == '\\') {
+            (*p)++;
+            switch (**p) {
+                case 'n':  out[i++] = '\n'; break;
+                case 't':  out[i++] = '\t'; break;
+                case 'r':  out[i++] = '\r'; break;
+                case '\\': out[i++] = '\\'; break;
+                case '"':  out[i++] = '"';  break;
+                case '/':  out[i++] = '/';  break;
+                case 'x': {
+                    /* \xHH hex escape — read two hex digits */
+                    if ((*p)[1] && (*p)[2]) {
+                        unsigned int val = 0;
+                        int valid = 1;
+                        for (int _j = 1; _j <= 2; _j++) {
+                            char _c = (*p)[_j];
+                            val <<= 4;
+                            if      (_c >= '0' && _c <= '9') val += _c - '0';
+                            else if (_c >= 'a' && _c <= 'f') val += _c - 'a' + 10;
+                            else if (_c >= 'A' && _c <= 'F') val += _c - 'A' + 10;
+                            else { valid = 0; break; }
+                        }
+                        if (valid && val <= 255) {
+                            out[i++] = (char)val;
+                            (*p) += 2;
+                        } else {
+                            out[i++] = 'x';
+                        }
+                    } else {
+                        out[i++] = 'x';
+                    }
+                    break;
+                }
+                default:   out[i++] = **p;  break;  /* unknown escape, take literal */
+            }
+        } else {
+            out[i++] = **p;
+        }
+        (*p)++;
+    }
+    out[i] = 0; g_read_str_actual_len = (int)i; if (**p == '"') (*p)++; return 1;
+}
+static int read_u64(const char **p, uint64_t *o);  /* forward decl */
+/* Read a JSON value as a string: accepts both "quoted strings" and bare integers.
+ * Falls back to read_u64 -> snprintf when the value is a JSON number. */
+static int read_str_or_int(const char **p, char *out, size_t max) {
+    if (read_str(p, out, max)) return 1;
+    /* Not a string - try integer (JSON number without quotes) */
+    const char *save = *p;
+    uint64_t v;
+    if (read_u64(p, &v)) {
+        snprintf(out, max, "%llu", (unsigned long long)v);
+        return 1;
+    }
+    /* Also try negative integer */
+    *p = save;
+    skip_ws(p);
+    int neg = 0;
+    if (**p == '-') { neg = 1; (*p)++; }
+    if (read_u64(p, &v)) {
+        snprintf(out, max, "%s%llu", neg ? "-" : "", (unsigned long long)v);
+        return 1;
+    }
+    *p = save;
+    return 0;
+}
+static int read_u64(const char **p, uint64_t *o) {
+    skip_ws(p); *o = 0; int f = 0;
+    while (**p >= '0' && **p <= '9') { *o = *o * 10 + (**p - '0'); (*p)++; f = 1; }
+    return f;
+}
+static int read_dbl(const char **p, double *o) {
+    skip_ws(p); char *e; *o = strtod(*p, &e); if (e == *p) return 0; *p = e; return 1;
+}
+static int read_bool(const char **p, int *o) {
+    skip_ws(p);
+    if (!strncmp(*p, "true", 4)) { *o = 1; *p += 4; return 1; }
+    if (!strncmp(*p, "false", 5)) { *o = 0; *p += 5; return 1; }
+    return 0;
+}
+static void skip_val(const char **p) {
+    skip_ws(p);
+    if (**p == '"') { (*p)++; while (**p && **p != '"') { if (**p == '\\') (*p)++; if (**p) (*p)++; } if (**p == '"') (*p)++; return; }
+    if (**p == '{') { int d = 1; (*p)++; while (**p && d) { if (**p == '{') d++; else if (**p == '}') d--; else if (**p == '"') { (*p)++; while (**p && **p != '"'){if(**p=='\\')(*p)++;if(**p)(*p)++;}} if (**p)(*p)++; } return; }
+    if (**p == '[') { int d = 1; (*p)++; while (**p && d) { if (**p == '[') d++; else if (**p == ']') d--; else if (**p == '"') { (*p)++; while (**p && **p != '"'){if(**p=='\\')(*p)++;if(**p)(*p)++;}} if (**p)(*p)++; } return; }
+    if (**p == 't') { *p += 4; return; } if (**p == 'f') { *p += 5; return; } if (**p == 'n') { *p += 4; return; }
+    if ((**p >= '0' && **p <= '9') || **p == '-') { char *e; strtod(*p, &e); *p = e; }
+}
+
+/* ---- parse a single policy_group entry ---- */
+static int parse_policy_group(const char **p, ftfuzz_policy_group_t *g) {
+    memset(g, 0, sizeof(*g));
+    skip_ws(p); if (**p != '{') return 0; (*p)++;
+    while (**p) {
+        skip_ws(p); if (**p == '}') { (*p)++; break; }
+        if (**p == ',') { (*p)++; continue; }
+        char k[64] = {0}; if (!read_str(p, k, sizeof(k))) { skip_val(p); continue; }
+        skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+
+        if (!strcmp(k, "enabled")) read_bool(p, &g->enabled);
+        else if (!strcmp(k, "priority")) read_dbl(p, &g->priority);
+        else if (!strcmp(k, "confidence")) read_dbl(p, &g->confidence);
+        else if (!strcmp(k, "semantic_source")) read_str(p, g->semantic_source, sizeof(g->semantic_source));
+        else if (!strcmp(k, "llm_model")) read_str(p, g->llm_model, sizeof(g->llm_model));
+        else if (!strcmp(k, "representative_transition")) read_str(p, g->representative_transition, sizeof(g->representative_transition));
+        else if (!strcmp(k, "semantic_edit_plan")) {
+            skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+            while (**p) {
+                skip_ws(p); if (**p == '}') { (*p)++; break; }
+                if (**p == ',') { (*p)++; continue; }
+                char ek[32] = {0}; if (!read_str(p, ek, sizeof(ek))) { skip_val(p); continue; }
+                skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                if (!strcmp(ek, "enabled")) read_bool(p, &g->edit_plan_enabled);
+                else if (!strcmp(ek, "barrier_kind")) read_str(p, g->edit_barrier_kind, sizeof(g->edit_barrier_kind));
+                else if (!strcmp(ek, "edit_ops")) {
+                    skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == ']') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        if (g->semantic_edit_op_count >= FTFUZZ_MAX_EDIT_OPS) { skip_val(p); continue; }
+                        skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+                        ftfuzz_semantic_edit_op_t *eo = &g->semantic_edit_ops[g->semantic_edit_op_count++];
+                        memset(eo, 0, sizeof(*eo));
+                        while (**p) {
+                            skip_ws(p); if (**p == '}') { (*p)++; break; }
+                            if (**p == ',') { (*p)++; continue; }
+                            char opk[32] = {0}; if (!read_str(p, opk, sizeof(opk))) { skip_val(p); continue; }
+                            skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                            if (!strcmp(opk, "op")) read_str(p, eo->op, sizeof(eo->op));
+                            else if (!strcmp(opk, "target")) read_str(p, eo->target, sizeof(eo->target));
+                            else if (!strcmp(opk, "purpose")) read_str(p, eo->purpose, sizeof(eo->purpose));
+                            else if (!strcmp(opk, "weight")) read_dbl(p, &eo->weight);
+                            else skip_val(p);
+                        }
+                    }
+                } else skip_val(p);
+            }
+        }
+        else if (!strcmp(k, "member_transitions")) {
+            skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+            while (**p) {
+                skip_ws(p); if (**p == ']') { (*p)++; break; }
+                if (**p == ',') { (*p)++; continue; }
+                if (g->member_transition_count < FTFUZZ_MAX_MEMBERS_PER_GROUP)
+                    read_str(p, g->member_transitions[g->member_transition_count++], FTFUZZ_MAX_ID_LEN);
+                else skip_val(p);
+            }
+        }
+        else if (!strcmp(k, "activation")) {
+            skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+            while (**p) {
+                skip_ws(p); if (**p == '}') { (*p)++; break; }
+                if (**p == ',') { (*p)++; continue; }
+                char ak[32] = {0}; if (!read_str(p, ak, sizeof(ak))) { skip_val(p); continue; }
+                skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                if (!strcmp(ak, "state_classes")) {
+                    skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == ']') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        if (g->activation_state_class_count < FTFUZZ_MAX_STATE_CLASSES)
+                            read_str(p, g->activation_state_classes[g->activation_state_class_count++], 64);
+                        else skip_val(p);
+                    }
+                } else skip_val(p);
+            }
+        }
+        else if (!strcmp(k, "mutation_actions")) {
+            skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+            while (**p) {
+                skip_ws(p); if (**p == '}') { (*p)++; break; }
+                if (**p == ',') { (*p)++; continue; }
+                char mk[32] = {0}; if (!read_str(p, mk, sizeof(mk))) { skip_val(p); continue; }
+                skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                if (!strcmp(mk, "dictionary_tokens")) {
+                    skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == ']') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+                        char tok[FTFUZZ_MAX_TOKEN_LEN] = {0};
+                        char src[64] = {0};
+                        while (**p) {
+                            skip_ws(p); if (**p == '}') { (*p)++; break; }
+                            if (**p == ',') { (*p)++; continue; }
+                            char tk[16] = {0}; if (!read_str(p, tk, sizeof(tk))) { skip_val(p); continue; }
+                            skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                            if (!strcmp(tk, "token"))
+                                read_str(p, tok, sizeof(tok));
+                            else if (!strcmp(tk, "source"))
+                                read_str(p, src, sizeof(src));
+                            else skip_val(p);
+                        }
+                        if (tok[0] && g->dictionary_token_count < FTFUZZ_MAX_TOKEN_COUNT) {
+                            strncpy(g->dictionary_tokens[g->dictionary_token_count].token, tok, FTFUZZ_MAX_TOKEN_LEN - 1);
+                            g->dictionary_tokens[g->dictionary_token_count].token_len = g_read_str_actual_len;
+                            strncpy(g->dictionary_tokens[g->dictionary_token_count].source, src, sizeof(src) - 1);
+                            g->dictionary_token_count++;
+                        }
+                    }
+                } else if (!strcmp(mk, "operator_weights")) {
+                    skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == '}') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        char wk[32] = {0}; if (!read_str(p, wk, sizeof(wk))) { skip_val(p); continue; }
+                        skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                        double w = 0; read_dbl(p, &w);
+                        if (!strcmp(wk, "dictionary_insert")) g->op_dictionary_insert = w;
+                        else if (!strcmp(wk, "fallback_havoc")) g->op_fallback_havoc = w;
+                        else if (!strcmp(wk, "region_focus")) g->op_region_focus = w;
+                        else if (!strcmp(wk, "numeric_boundary")) g->op_numeric_boundary = w;
+                        else if (!strcmp(wk, "structure_insert")) g->op_structure_insert = w;
+                        else if (!strcmp(wk, "repair")) g->op_repair = w;
+                    }
+                } else if (!strcmp(mk, "preserve_ranges") || !strcmp(mk, "focus_ranges")
+                         || !strcmp(mk, "preferred_insert_ranges")) {
+                    /* Parse array of byte ranges */
+                    ftfuzz_byte_range_t *dst = NULL;
+                    size_t *count = NULL;
+                    if (!strcmp(mk, "preserve_ranges")) {
+                        dst = g->preserve_ranges; count = &g->preserve_range_count;
+                    } else if (!strcmp(mk, "focus_ranges")) {
+                        dst = g->focus_ranges; count = &g->focus_range_count;
+                    } else {
+                        dst = g->insert_ranges; count = &g->insert_range_count;
+                    }
+
+                    skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == ']') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        if (*count >= FTFUZZ_MAX_RANGES_PER_GROUP) { skip_val(p); continue; }
+                        skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+                        ftfuzz_byte_range_t *r = &dst[(*count)++];
+                        memset(r, 0, sizeof(*r));
+                        while (**p) {
+                            skip_ws(p); if (**p == '}') { (*p)++; break; }
+                            if (**p == ',') { (*p)++; continue; }
+                            char rk[32] = {0};
+                            if (!read_str(p, rk, sizeof(rk))) { skip_val(p); continue; }
+                            skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                            if (!strcmp(rk, "start")) { uint64_t v; if (read_u64(p, &v)) r->start = (uint32_t)v; }
+                            else if (!strcmp(rk, "end")) { uint64_t v; if (read_u64(p, &v)) r->end = (uint32_t)v; }
+                            else if (!strcmp(rk, "length")) { uint64_t v; if (read_u64(p, &v)) r->length = (uint32_t)v; }
+                            else if (!strcmp(rk, "confidence")) read_dbl(p, &r->confidence);
+                            else if (!strcmp(rk, "role")) read_str(p, r->role, sizeof(r->role));
+                            else skip_val(p);
+                        }
+                    }
+                } else skip_val(p);
+            }
+        } else if (!strcmp(k, "desired_outcome")) {
+            int v; if (read_bool(p, &v)) g->desired_outcome = v ? 1 : 0;
+        } else if (!strcmp(k, "direction_source")) {
+            read_str(p, g->direction_source, sizeof(g->direction_source));
+        } else if (!strcmp(k, "ontology_action_plan")) {
+            /* Parse ontology action plan (Stage 2.3-pre) */
+            skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+            while (**p) {
+                skip_ws(p); if (**p == '}') { (*p)++; break; }
+                if (**p == ',') { (*p)++; continue; }
+                char oak[32] = {0}; if (!read_str(p, oak, sizeof(oak))) { skip_val(p); continue; }
+                skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                if (!strcmp(oak, "compiled_actions")) {
+                    skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == ']') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        if (g->ontology_action_count >= FTFUZZ_MAX_ONTOLOGY_ACTIONS) { skip_val(p); continue; }
+                        skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+                        ftfuzz_ontology_action_t *oa = &g->ontology_actions[g->ontology_action_count++];
+                        memset(oa, 0, sizeof(*oa));
+                        while (**p) {
+                            skip_ws(p); if (**p == '}') { (*p)++; break; }
+                            if (**p == ',') { (*p)++; continue; }
+                            char ak[32] = {0}; if (!read_str(p, ak, sizeof(ak))) { skip_val(p); continue; }
+                            skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                            if (!strcmp(ak, "action_id")) read_str(p, oa->action_id, sizeof(oa->action_id));
+                            else if (!strcmp(ak, "source_atom")) read_str(p, oa->source_atom, sizeof(oa->source_atom));
+                            else if (!strcmp(ak, "op")) read_str(p, oa->op, sizeof(oa->op));
+                            else if (!strcmp(ak, "region_role")) read_str(p, oa->region_role, sizeof(oa->region_role));
+                            else if (!strcmp(ak, "scope")) read_str(p, oa->scope, sizeof(oa->scope));
+                            else if (!strcmp(ak, "confidence")) read_dbl(p, &oa->confidence);
+                            else if (!strcmp(ak, "evidence_tokens")) {
+                                skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+                                while (**p) {
+                                    skip_ws(p); if (**p == ']') { (*p)++; break; }
+                                    if (**p == ',') { (*p)++; continue; }
+                                    if (oa->evidence_token_count < FTFUZZ_MAX_TOKEN_COUNT)
+                                        read_str(p, oa->evidence_tokens[oa->evidence_token_count++], FTFUZZ_MAX_TOKEN_LEN);
+                                    else skip_val(p);
+                                }
+                            }
+                            else skip_val(p);
+                        }
+                    }
+                } else if (!strcmp(oak, "forbidden_tokens")) {
+                    skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == ']') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        if (g->forbidden_token_count < FTFUZZ_MAX_FORBIDDEN_TOKENS)
+                            read_str(p, g->forbidden_tokens[g->forbidden_token_count++], FTFUZZ_MAX_TOKEN_LEN);
+                        else skip_val(p);
+                    }
+                } else skip_val(p);
+            }
+        } else if (!strcmp(k, "action_chain")) {
+            /* Stage 2.7: Parse action_chain sub-object */
+            { FILE *dbg = fopen("/tmp/mutator_scaffold_debug.log", "a");
+              if(dbg){ fprintf(dbg, "[AC_ENTER] group=%s\n", g->policy_group_id); fclose(dbg); } }
+            skip_ws(p); if (**p != '{') {
+                { FILE *dbg = fopen("/tmp/mutator_scaffold_debug.log", "a");
+                  if(dbg){ fprintf(dbg, "[AC_NOT_OBJ] group=%s char=%c\n", g->policy_group_id, **p); fclose(dbg); } }
+                skip_val(p); continue;
+            } (*p)++;
+            while (**p) {
+                skip_ws(p); if (**p == '}') { (*p)++; break; }
+                if (**p == ',') { (*p)++; continue; }
+                char ack[64] = {0}; if (!read_str(p, ack, sizeof(ack))) { skip_val(p); continue; }
+                skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+
+                { FILE *dbg = fopen("/tmp/mutator_scaffold_debug.log", "a");
+                  if(dbg){ fprintf(dbg, "[AC_KEY] group=%s key=%s\n", g->policy_group_id, ack); fclose(dbg); } }
+
+                if (!strcmp(ack, "precondition_tokens")) {
+                    skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == ']') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        if (g->precondition_token_count < FTFUZZ_MAX_PRECONDITION_TOKENS) {
+                            read_str(p, g->precondition_tokens[g->precondition_token_count], FTFUZZ_MAX_TOKEN_LEN);
+                            g->precondition_token_len[g->precondition_token_count] = g_read_str_actual_len;
+                            g->precondition_token_count++;
+                        }
+                        else skip_val(p);
+                    }
+                } else if (!strcmp(ack, "scaffold_template")) {
+                    read_str(p, g->scaffold_template, sizeof(g->scaffold_template));
+                    g->scaffold_template_len = g_read_str_actual_len;
+                    /* DEBUG: log scaffold load result */
+                    {
+                        FILE *dbg = fopen("/tmp/mutator_scaffold_debug.log", "a");
+                        if (dbg) {
+                            fprintf(dbg, "[SCAFFOLD_LOAD] group=%s len=%d tmpl=%.200s\n",
+                                    g->policy_group_id, g->scaffold_template_len,
+                                    g->scaffold_template_len > 0 ? g->scaffold_template : "(empty)");
+                            fclose(dbg);
+                        }
+                    }
+                } else if (!strcmp(ack, "donor_rebase_policy")) {
+                    skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == '}') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        char dk[32] = {0}; if (!read_str(p, dk, sizeof(dk))) { skip_val(p); continue; }
+                        skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                        if (!strcmp(dk, "enabled")) read_bool(p, &g->donor_rebase.enabled);
+                        else if (!strcmp(dk, "require_path_relevance")) read_bool(p, &g->donor_rebase.require_path_relevance);
+                        else if (!strcmp(dk, "max_donor_scan")) { uint64_t v; if (read_u64(p, &v)) g->donor_rebase.max_donor_scan = (uint32_t)v; }
+                        else if (!strcmp(dk, "anchor_satisfaction_weight")) read_dbl(p, &g->donor_rebase.anchor_satisfaction_weight);
+                        else if (!strcmp(dk, "frontier_survival_weight")) read_dbl(p, &g->donor_rebase.frontier_survival_weight);
+                        else if (!strcmp(dk, "path_relevance_weight")) read_dbl(p, &g->donor_rebase.path_relevance_weight);
+                        else skip_val(p);
+                    }
+                } else if (!strcmp(ack, "preserve_mask_policy")) {
+                    skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == '}') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        char mk[32] = {0}; if (!read_str(p, mk, sizeof(mk))) { skip_val(p); continue; }
+                        skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                        if (!strcmp(mk, "enabled")) read_bool(p, &g->preserve_mask.enabled);
+                        else if (!strcmp(mk, "default_protection")) { uint64_t v; if (read_u64(p, &v)) g->preserve_mask.default_protection = (uint32_t)v; }
+                        else if (!strcmp(mk, "protect_inserted_ranges")) read_bool(p, &g->preserve_mask.protect_inserted_ranges);
+                        else if (!strcmp(mk, "protect_binding_keys")) read_bool(p, &g->preserve_mask.protect_binding_keys);
+                        else if (!strcmp(mk, "max_protected_ratio")) { double v; if (read_dbl(p, &v)) g->preserve_mask.max_protected_ratio = (float)v; }
+                        else skip_val(p);
+                    }
+                } else if (!strcmp(ack, "action_chain")) {
+                    /* Inner action_chain array: parse step objects */
+                    skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == ']') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        if (g->action_step_count >= FTFUZZ_MAX_EDIT_OPS) { skip_val(p); continue; }
+                        skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+                        ftfuzz_action_step_t *step = &g->action_steps[g->action_step_count];
+                        memset(step, 0, sizeof(*step));
+                        while (**p) {
+                            skip_ws(p); if (**p == '}') { (*p)++; break; }
+                            if (**p == ',') { (*p)++; continue; }
+                            char sk[32] = {0}; if (!read_str(p, sk, sizeof(sk))) { skip_val(p); continue; }
+                            skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                            if (!strcmp(sk, "step")) { uint64_t v; if (read_u64(p, &v)) step->step = (int)v; }
+                            else if (!strcmp(sk, "source_step")) { uint64_t v; if (read_u64(p, &v)) step->source_step = (int)v; }
+                            else if (!strcmp(sk, "action_id")) read_str(p, step->action_id, sizeof(step->action_id));
+                            else if (!strcmp(sk, "op")) read_str(p, step->op, sizeof(step->op));
+                            else if (!strcmp(sk, "region_role")) read_str(p, step->region_role, sizeof(step->region_role));
+                            else if (!strcmp(sk, "relation_id")) read_str(p, step->relation_id, sizeof(step->relation_id));
+                            else if (!strcmp(sk, "requires_success_before_next")) { int v; if (read_bool(p, &v)) step->requires_success = v; }
+                            else if (!strcmp(sk, "parameters")) {
+                                skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+                                while (**p) {
+                                    skip_ws(p); if (**p == '}') { (*p)++; break; }
+                                    if (**p == ',') { (*p)++; continue; }
+                                    char pk[64] = {0}; if (!read_str(p, pk, sizeof(pk))) { skip_val(p); continue; }
+                                    skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                                    if (step->param_count < FTFUZZ_MAX_OP_PARAMS) {
+                                        strncpy(step->param_keys[step->param_count], pk, 63);
+                                        read_str_or_int(p, step->param_values[step->param_count], FTFUZZ_MAX_PARAM_VALUE_LEN);
+                                        step->param_count++;
+                                    } else skip_val(p);
+                                }
+                            }
+                            else skip_val(p);
+                        }
+                        g->action_step_count++;
+                    }
+                } else skip_val(p);
+            }
+        } else skip_val(p);
+    }
+    return 1;
+}
+
+/* ---- parse legacy flat policy entry ---- */
+static int parse_policy_entry(const char **p, ftfuzz_policy_entry_t *e) {
+    memset(e, 0, sizeof(*e));
+    skip_ws(p); if (**p != '{') return 0; (*p)++;
+    while (**p) {
+        skip_ws(p); if (**p == '}') { (*p)++; break; }
+        if (**p == ',') { (*p)++; continue; }
+        char k[64] = {0}; if (!read_str(p, k, sizeof(k))) { skip_val(p); continue; }
+        skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+        if (!strcmp(k, "transition_id")) read_str(p, e->transition_id, sizeof(e->transition_id));
+        else if (!strcmp(k, "enabled")) read_bool(p, &e->enabled);
+        else if (!strcmp(k, "confidence")) read_dbl(p, &e->confidence);
+        else if (!strcmp(k, "priority")) read_dbl(p, &e->priority);
+        else if (!strcmp(k, "semantic_source")) read_str(p, e->semantic_source, sizeof(e->semantic_source));
+        else if (!strcmp(k, "llm_model")) read_str(p, e->llm_model, sizeof(e->llm_model));
+        else if (!strcmp(k, "policy_version")) { uint64_t v; read_u64(p, &v); e->policy_version = v; }
+        else if (!strcmp(k, "activation")) {
+            skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+            while (**p) {
+                skip_ws(p); if (**p == '}') { (*p)++; break; }
+                if (**p == ',') { (*p)++; continue; }
+                char ak[32] = {0}; if (!read_str(p, ak, sizeof(ak))) { skip_val(p); continue; }
+                skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                if (!strcmp(ak, "state_classes")) {
+                    skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == ']') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        if (e->activation_state_class_count < FTFUZZ_MAX_STATE_CLASSES)
+                            read_str(p, e->activation_state_classes[e->activation_state_class_count++], 64);
+                        else skip_val(p);
+                    }
+                } else skip_val(p);
+            }
+        }
+        else if (!strcmp(k, "mutation_actions")) {
+            skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+            while (**p) {
+                skip_ws(p); if (**p == '}') { (*p)++; break; }
+                if (**p == ',') { (*p)++; continue; }
+                char mk[32] = {0}; if (!read_str(p, mk, sizeof(mk))) { skip_val(p); continue; }
+                skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                if (!strcmp(mk, "dictionary_tokens")) {
+                    skip_ws(p); if (**p != '[') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == ']') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+                        char tok[FTFUZZ_MAX_TOKEN_LEN] = {0};
+                        while (**p) {
+                            skip_ws(p); if (**p == '}') { (*p)++; break; }
+                            if (**p == ',') { (*p)++; continue; }
+                            char tk[16] = {0}; if (!read_str(p, tk, sizeof(tk))) { skip_val(p); continue; }
+                            skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                            if (!strcmp(tk, "token"))
+                                read_str(p, tok, sizeof(tok));
+                            else skip_val(p);
+                        }
+                        if (tok[0] && e->dictionary_token_count < FTFUZZ_MAX_TOKEN_COUNT) {
+                            strncpy(e->dictionary_tokens[e->dictionary_token_count++], tok, FTFUZZ_MAX_TOKEN_LEN-1);
+                        }
+                    }
+                } else if (!strcmp(mk, "operator_weights")) {
+                    skip_ws(p); if (**p != '{') { skip_val(p); continue; } (*p)++;
+                    while (**p) {
+                        skip_ws(p); if (**p == '}') { (*p)++; break; }
+                        if (**p == ',') { (*p)++; continue; }
+                        char wk[32] = {0}; if (!read_str(p, wk, sizeof(wk))) { skip_val(p); continue; }
+                        skip_ws(p); if (**p != ':') { skip_val(p); continue; } (*p)++;
+                        double w = 0; read_dbl(p, &w);
+                        if (!strcmp(wk, "dictionary_insert")) e->op_dictionary_insert = w;
+                        else if (!strcmp(wk, "fallback_havoc")) e->op_fallback_havoc = w;
+                        else if (!strcmp(wk, "region_focus")) e->op_region_focus = w;
+                        else if (!strcmp(wk, "numeric_boundary")) e->op_numeric_boundary = w;
+                        else if (!strcmp(wk, "repair")) e->op_repair = w;
+                    }
+                } else if (!strcmp(mk, "preserve_hints_count")) { uint64_t v; if (read_u64(p, &v)) e->preserve_hint_count = (size_t)v; }
+                else if (!strcmp(mk, "focus_hints_count")) { uint64_t v; if (read_u64(p, &v)) e->focus_hint_count = (size_t)v; }
+                else if (!strcmp(mk, "numeric_hints_count")) { uint64_t v; if (read_u64(p, &v)) e->numeric_hint_count = (size_t)v; }
+                else if (!strcmp(mk, "repair_hints_count")) { uint64_t v; if (read_u64(p, &v)) e->repair_hint_count = (size_t)v; }
+                else skip_val(p);
+            }
+        } else skip_val(p);
+    }
+    return 1;
+}
+
+/* ---- parse transition_to_policy_group mapping ---- */
+static int parse_transition_mapping(const char **p,
+                                     ftfuzz_transition_policy_mapping_t *m) {
+    memset(m, 0, sizeof(*m));
+    read_str(p, m->transition_id, sizeof(m->transition_id));
+    skip_ws(p); if (**p != ':') { skip_val(p); return 0; } (*p)++;
+    read_str(p, m->policy_group_id, sizeof(m->policy_group_id));
+    return 1;
+}
+
+/* ---- unified v2 store parser ---- */
+static int parse_v2_store(const char *json, ftfuzz_policy_store_v2_t *out) {
+    memset(out, 0, sizeof(*out));
+    const char *p = json;
+    skip_ws(&p); if (*p != '{') return 0; p++;
+    while (*p) {
+        skip_ws(&p); if (*p == '}') { p++; break; }
+        if (*p == ',') { p++; continue; }
+        char k[64] = {0}; if (!read_str(&p, k, sizeof(k))) { skip_val(&p); continue; }
+        skip_ws(&p); if (*p != ':') { skip_val(&p); continue; } p++;
+
+        if (!strcmp(k, "store_version")) read_u64(&p, &out->store_version);
+        else if (!strcmp(k, "schema_version")) read_str(&p, out->schema_version, sizeof(out->schema_version));
+        else if (!strcmp(k, "activation_mode")) read_str(&p, out->activation_mode, sizeof(out->activation_mode));
+        else if (!strcmp(k, "policy_groups")) {
+            /* Primary v2 path: parse policy_groups object */
+            skip_ws(&p); if (*p != '{') { skip_val(&p); continue; } p++;
+            while (*p) {
+                skip_ws(&p); if (*p == '}') { p++; break; }
+                if (*p == ',') { p++; continue; }
+                /* Read group key (e.g. "PG_0001") */
+                char gid[FTFUZZ_MAX_ID_LEN] = {0};
+                if (!read_str(&p, gid, sizeof(gid))) { skip_val(&p); continue; }
+                skip_ws(&p); if (*p != ':') { skip_val(&p); continue; } p++;
+                if (out->policy_group_count < FTFUZZ_MAX_POLICY_GROUPS) {
+                    ftfuzz_policy_group_t *g = &out->policy_groups[out->policy_group_count];
+                    parse_policy_group(&p, g);
+                    strncpy(g->policy_group_id, gid, FTFUZZ_MAX_ID_LEN - 1);
+                    out->policy_group_count++;
+                } else skip_val(&p);
+            }
+        }
+        else if (!strcmp(k, "transition_to_policy_group")) {
+            /* Parse transition -> group mappings */
+            skip_ws(&p); if (*p != '{') { skip_val(&p); continue; } p++;
+            while (*p) {
+                skip_ws(&p); if (*p == '}') { p++; break; }
+                if (*p == ',') { p++; continue; }
+                if (out->transition_mapping_count < FTFUZZ_MAX_TRANSITION_MAPPINGS) {
+                    ftfuzz_transition_policy_mapping_t *m =
+                        &out->mappings[out->transition_mapping_count];
+                    if (parse_transition_mapping(&p, m))
+                        out->transition_mapping_count++;
+                } else { skip_val(&p); skip_val(&p); }
+            }
+        }
+        else if (!strcmp(k, "policies")) {
+            /* Legacy flat policies (fallback path) */
+            skip_ws(&p); if (*p != '{') { skip_val(&p); continue; } p++;
+            while (*p) {
+                skip_ws(&p); if (*p == '}') { p++; break; }
+                if (*p == ',') { p++; continue; }
+                char tid[128] = {0}; read_str(&p, tid, sizeof(tid));
+                skip_ws(&p); if (*p != ':') { skip_val(&p); continue; } p++;
+                if (out->policy_count < FTFUZZ_MAX_POLICIES)
+                    parse_policy_entry(&p, &out->policies[out->policy_count++]);
+                else skip_val(&p);
+            }
+        } else skip_val(&p);
+    }
+    return 1;
+}
+
+/* ---- find group by transition_id via mappings ---- */
+static ftfuzz_policy_group_t *find_group_for_transition(const char *tid) {
+    /* Look up mapping first */
+    const char *gid = NULL;
+    for (size_t i = 0; i < g_store.transition_mapping_count; i++) {
+        if (!strcmp(g_store.mappings[i].transition_id, tid)) {
+            gid = g_store.mappings[i].policy_group_id;
+            break;
+        }
+    }
+    if (!gid) return NULL;
+
+    /* Find group by id */
+    for (size_t i = 0; i < g_store.policy_group_count; i++) {
+        if (!strcmp(g_store.policy_groups[i].policy_group_id, gid))
+            return &g_store.policy_groups[i];
+    }
+    return NULL;
+}
+
+/* ---- state class weight ---- */
+static double state_class_weight(const char *sc) {
+    if (!strcmp(sc, "Blocked-at-Barrier"))        return 1.00;
+    if (!strcmp(sc, "Barrier-Reached"))           return 0.90;
+    if (!strcmp(sc, "Reach-Pre"))                 return 0.60;
+    if (!strcmp(sc, "Progressed-Through-Barrier")) return 0.40;
+    if (!strcmp(sc, "Reach-Post"))                return 0.10;
+    if (!strcmp(sc, "Near-Post"))                 return 0.15;
+    if (!strcmp(sc, "Fail-Pre"))                  return 0.00;
+    if (!strcmp(sc, "Invalid-Post-Without-Pre"))  return -1.00;
+    return 0.20; /* unknown */
+}
+
+/* ---- seed-state-conditioned policy group selection ---- */
+int ftfuzz_policy_loader_select_for_seed(
+    const char *seed_path,
+    const char *ftstate_path,
+    ftfuzz_policy_group_t *out_group,
+    char *out_transition_id,
+    size_t out_transition_id_size,
+    char *out_state_class,
+    size_t out_state_class_size)
+{
+    memset(out_group, 0, sizeof(*out_group));
+    if (out_transition_id) out_transition_id[0] = 0;
+    if (out_state_class) out_state_class[0] = 0;
+
+    if (!ftstate_path || !ftstate_path[0]) return 0;
+    if (g_store.policy_group_count == 0 && g_store.policy_count == 0) return 0;
+
+    FILE *fp = fopen(ftstate_path, "r");
+    if (!fp) return 0;
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
+    if (sz <= 0 || sz > 1024 * 1024) { fclose(fp); return 0; }
+    char *json = malloc(sz + 1);
+    if (!json) { fclose(fp); return 0; }
+    fread(json, 1, sz, fp); json[sz] = 0; fclose(fp);
+
+    /* Find "transitions": {...} */
+    const char *tp = strstr(json, "\"transitions\"");
+    if (!tp) { free(json); return 0; }
+    tp = strchr(tp, '{'); if (!tp) { free(json); return 0; }
+    tp++; /* advance past opening brace of transitions object */
+
+    double best_score = -999.0;
+    ftfuzz_policy_group_t best_group;
+    char best_tid[FTFUZZ_MAX_ID_LEN] = {0};
+    char best_sc[64] = {0};
+    memset(&best_group, 0, sizeof(best_group));
+    int found = 0;
+
+    /* Extract tid -> state_class from sidecar */
+    while (*tp) {
+        skip_ws(&tp); if (*tp == '}') break;
+        if (*tp == ',') { tp++; continue; }
+        char tid[128] = {0};
+        if (!read_str(&tp, tid, sizeof(tid))) { skip_val(&tp); continue; }
+        skip_ws(&tp); if (*tp != ':') { skip_val(&tp); continue; } tp++;
+
+        /* Inside per-transition object, derive state from barrier counts */
+        skip_ws(&tp); if (*tp != '{') { skip_val(&tp); continue; } tp++;
+        int bar_hit = 0, tgt_taken = 0, non_tgt_taken = 0;
+        while (*tp) {
+            skip_ws(&tp); if (*tp == '}') { tp++; break; }
+            if (*tp == ',') { tp++; continue; }
+            char fk[32] = {0};
+            if (!read_str(&tp, fk, sizeof(fk))) { skip_val(&tp); continue; }
+            skip_ws(&tp); if (*tp != ':') { skip_val(&tp); continue; } tp++;
+            if (!strcmp(fk, "barrier_hit_count")) {
+                uint64_t v = 0; read_u64(&tp, &v); bar_hit = (int)v;
+            } else if (!strcmp(fk, "target_edge_taken_count")) {
+                uint64_t v = 0; read_u64(&tp, &v); tgt_taken = (int)v;
+            } else if (!strcmp(fk, "non_target_edge_taken_count")) {
+                uint64_t v = 0; read_u64(&tp, &v); non_tgt_taken = (int)v;
+            }
+            else skip_val(&tp);
+        }
+
+        /* Derive state_class from raw counts */
+        char sc[64] = {0};
+        if (tgt_taken > 0)
+            strncpy(sc, "Progressed-Through-Barrier", sizeof(sc) - 1);
+        else if (bar_hit > 0)
+            strncpy(sc, "Barrier-Reached", sizeof(sc) - 1);
+        else
+            strncpy(sc, "Reach-Pre", sizeof(sc) - 1);
+
+        if (!sc[0]) continue;
+
+        /* Convert numeric state_id (sidecar key) to transition_id */
+        int sid = 0;
+        const char *tp2 = tid;
+        while (*tp2 >= '0' && *tp2 <= '9') { sid = sid * 10 + (*tp2 - '0'); tp2++; }
+        char tid_resolved[FTFUZZ_MAX_ID_LEN] = {0};
+        if (sid > 0 && ftfuzz_state_map_lookup(sid, tid_resolved, sizeof(tid_resolved)))
+            strncpy(tid, tid_resolved, sizeof(tid) - 1);
+
+        /* --- Primary path: group-based lookup --- */
+        ftfuzz_policy_group_t *grp = find_group_for_transition(tid);
+        if (grp && grp->enabled) {
+            double sw = state_class_weight(sc);
+            if (sw <= -0.5) continue; /* skip invalid */
+            double score = grp->priority + sw;
+            if (score > best_score) {
+                best_score = score;
+                best_group = *grp;
+                strncpy(best_tid, tid, sizeof(best_tid) - 1);
+                strncpy(best_sc, sc, sizeof(best_sc) - 1);
+                found = 1;
+            }
+        }
+
+        /* --- Fallback: legacy flat-policy lookup --- */
+        for (size_t i = 0; i < g_store.policy_count; i++) {
+            ftfuzz_policy_entry_t *pe = &g_store.policies[i];
+            if (!pe->enabled) continue;
+            if (strcmp(pe->transition_id, tid) != 0) continue;
+            int sc_match = 0;
+            for (size_t j = 0; j < pe->activation_state_class_count; j++) {
+                if (!strcmp(pe->activation_state_classes[j], sc)) { sc_match = 1; break; }
+            }
+            double pri = pe->priority * (sc_match ? 1.0 : 0.3);
+            if (pri > best_score) {
+                best_score = pri;
+                /* Map legacy entry to group output */
+                memset(&best_group, 0, sizeof(best_group));
+                strncpy(best_group.policy_group_id, pe->transition_id, FTFUZZ_MAX_ID_LEN - 1);
+                best_group.enabled = pe->enabled;
+                best_group.priority = pe->priority;
+                best_group.confidence = pe->confidence;
+                strncpy(best_group.semantic_source, pe->semantic_source, sizeof(best_group.semantic_source) - 1);
+                strncpy(best_group.llm_model, pe->llm_model, sizeof(best_group.llm_model) - 1);
+                strncpy(best_group.representative_transition, pe->transition_id, sizeof(best_group.representative_transition) - 1);
+                best_group.dictionary_token_count = pe->dictionary_token_count;
+                for (size_t t = 0; t < pe->dictionary_token_count; t++) {
+                    strncpy(best_group.dictionary_tokens[t].token, pe->dictionary_tokens[t], FTFUZZ_MAX_TOKEN_LEN - 1);
+                }
+                best_group.op_dictionary_insert = pe->op_dictionary_insert;
+                best_group.op_fallback_havoc = pe->op_fallback_havoc;
+                best_group.op_region_focus = pe->op_region_focus;
+                best_group.op_numeric_boundary = pe->op_numeric_boundary;
+                best_group.op_repair = pe->op_repair;
+                best_group.activation_state_class_count = pe->activation_state_class_count;
+                memcpy(best_group.activation_state_classes, pe->activation_state_classes,
+                       sizeof(best_group.activation_state_classes));
+                strncpy(best_tid, tid, sizeof(best_tid) - 1);
+                strncpy(best_sc, sc, sizeof(best_sc) - 1);
+                found = 1;
+            }
+        }
+    }
+    free(json);
+
+    if (found) {
+        *out_group = best_group;
+        if (out_transition_id) strncpy(out_transition_id, best_tid, out_transition_id_size - 1);
+        if (out_state_class) strncpy(out_state_class, best_sc, out_state_class_size - 1);
+    }
+    return found;
+}
+
+/* ---- direct group lookup ---- */
+int ftfuzz_policy_loader_get_group_by_id(
+    const char *policy_group_id,
+    ftfuzz_policy_group_t *out_group)
+{
+    memset(out_group, 0, sizeof(*out_group));
+    if (!policy_group_id) return 0;
+    for (size_t i = 0; i < g_store.policy_group_count; i++) {
+        if (!strcmp(g_store.policy_groups[i].policy_group_id, policy_group_id)) {
+            *out_group = g_store.policy_groups[i];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- public API ---- */
+int ftfuzz_policy_loader_init(const char *path) {
+    const char *env = getenv("FTFUZZ_POLICY_STORE");
+    if (!path && env) path = env;
+    if (!path) return 0;
+    strncpy(g_store_path, path, sizeof(g_store_path) - 1);
+    return ftfuzz_policy_loader_reload_if_needed();
+}
+
+int ftfuzz_policy_loader_reload_if_needed(void) {
+    if (!g_store_path[0]) return 0;
+
+    /* Fast path: check mtime to avoid unnecessary re-reads */
+    struct stat st;
+    if (stat(g_store_path, &st) == 0) {
+        if (st.st_mtime == g_store_mtime) return 0;
+        g_store_mtime = st.st_mtime;
+    }
+
+    FILE *fp = fopen(g_store_path, "r");
+    if (!fp) return 0;
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
+    if (sz <= 0 || sz > 2 * 1024 * 1024) { fclose(fp); return 0; }
+    char *json = malloc(sz + 1);
+    if (!json) { fclose(fp); return 0; }
+    fread(json, 1, sz, fp); json[sz] = 0; fclose(fp);
+
+    ftfuzz_policy_store_v2_t *ns = calloc(1, sizeof(ftfuzz_policy_store_v2_t));
+    if (!ns) { free(json); return 0; }
+    if (!parse_v2_store(json, ns)) { free(json); free(ns); return 0; }
+    free(json);
+    if (ns->store_version && ns->store_version == g_store_version) { free(ns); return 0; }
+
+    g_store = *ns;
+    g_store_version = ns->store_version;
+    free(ns);
+
+    fprintf(stderr, "[STORE] loaded v%lu schema=%s mode=%s groups=%zu mappings=%zu policies=%zu\n",
+            (unsigned long)g_store_version, g_store.schema_version,
+            g_store.activation_mode,
+            g_store.policy_group_count, g_store.transition_mapping_count,
+            g_store.policy_count);
+
+    for (size_t i = 0; i < g_store.policy_group_count && i < 8; i++) {
+        ftfuzz_policy_group_t *g = &g_store.policy_groups[i];
+        fprintf(stderr, "[GROUP] %s source=%s model=%s enabled=%d priority=%.2f tokens=%zu members=%zu\n",
+                g->policy_group_id, g->semantic_source, g->llm_model,
+                g->enabled, g->priority, g->dictionary_token_count,
+                g->member_transition_count);
+        if (g->edit_plan_enabled) {
+            fprintf(stderr, "[EDIT_IR] group=%s ops=%zu barrier_kind=%s\n",
+                    g->policy_group_id, g->semantic_edit_op_count, g->edit_barrier_kind);
+            for (size_t j = 0; j < g->semantic_edit_op_count && j < 4; j++) {
+                fprintf(stderr, "[EDIT_OP] group=%s op=%s target=%s\n",
+                        g->policy_group_id,
+                        g->semantic_edit_ops[j].op,
+                        g->semantic_edit_ops[j].target);
+            }
+        }
+    }
+    for (size_t i = 0; i < g_store.transition_mapping_count && i < 5; i++) {
+        fprintf(stderr, "[MAP] %s -> %s\n",
+                g_store.mappings[i].transition_id,
+                g_store.mappings[i].policy_group_id);
+    }
+    /* Also log legacy policies if present */
+    if (g_store.policy_count > 0) {
+        fprintf(stderr, "[STORE] legacy policies: %zu (fallback path)\n",
+                g_store.policy_count);
+        for (size_t i = 0; i < g_store.policy_count && i < 3; i++) {
+            ftfuzz_policy_entry_t *pe = &g_store.policies[i];
+            fprintf(stderr, "[STORE]   policy[%zu] %s src=%s enabled=%d tokens=%zu pri=%.2f\n",
+                    i, pe->transition_id, pe->semantic_source, pe->enabled,
+                    pe->dictionary_token_count, pe->priority);
+        }
+    }
+    return 1;
+}
+
+int ftfuzz_policy_loader_get_store(ftfuzz_policy_store_v2_t *out) {
+    if (!g_store_version) return 0;
+    *out = g_store;
+    return 1;
+}
+
+void ftfuzz_policy_loader_destroy(void) {
+    g_store_version = 0;
+    memset(&g_store, 0, sizeof(g_store));
+    g_store_path[0] = 0;
+}
